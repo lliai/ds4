@@ -518,6 +518,7 @@ static void usage(FILE *fp) {
         "  --quality              Prefer exact kernels where available.\n"
         "  --warm-weights         Touch mapped tensor pages before generation.\n"
         "  --power N              Target GPU duty cycle percentage, 1..100. Default: 100\n"
+        "  --expert-mask FILE     Load a ds4-expert-mask-v1 JSON keep-list.\n"
         "  --dir-steering-file FILE\n"
         "  --dir-steering-ffn F\n"
         "  --dir-steering-attn F\n"
@@ -626,6 +627,8 @@ static agent_config parse_options(int argc, char **argv) {
             }
         } else if (!strcmp(arg, "--warm-weights")) {
             c.engine.warm_weights = true;
+        } else if (!strcmp(arg, "--expert-mask")) {
+            c.engine.expert_mask_file = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--dir-steering-file")) {
             c.engine.directional_steering_file = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--dir-steering-ffn")) {

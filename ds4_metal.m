@@ -13706,7 +13706,12 @@ int ds4_gpu_router_select_tensor(
         uint32_t                n_group_used,
         bool                    has_bias,
         bool                    hash_mode,
+        const uint8_t          *expert_mask,
         const ds4_gpu_tensor *logits) {
+    if (expert_mask) {
+        fprintf(stderr, "ds4: --expert-mask is currently supported on CPU/CUDA, not Metal\n");
+        return 0;
+    }
     if (!g_initialized && !ds4_gpu_init()) return 0;
     if (!selected || !weights || !probs || !logits || !model_map ||
         n_expert == 0 || n_expert_used == 0) return 0;
@@ -13799,10 +13804,15 @@ int ds4_gpu_router_select_batch_tensor(
         bool                    hash_mode,
         const ds4_gpu_tensor *logits,
         const ds4_gpu_tensor *tokens,
+        const uint8_t          *expert_mask,
         uint32_t                n_expert,
         uint32_t                n_expert_used,
         float                   expert_weight_scale,
         uint32_t                n_tokens) {
+    if (expert_mask) {
+        fprintf(stderr, "ds4: --expert-mask is currently supported on CPU/CUDA, not Metal\n");
+        return 0;
+    }
     if (!g_initialized && !ds4_gpu_init()) return 0;
     if (!selected || !weights || !probs || !logits || !tokens || !model_map ||
         n_expert == 0 || n_expert_used == 0 || n_tokens == 0) return 0;

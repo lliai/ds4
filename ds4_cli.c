@@ -41,6 +41,11 @@ typedef struct {
     const char *imatrix_output_path;
     int imatrix_max_prompts;
     int imatrix_max_tokens;
+    const char *expert_prune_dataset_path;
+    const char *expert_prune_output_path;
+    int expert_prune_max_prompts;
+    int expert_prune_max_tokens;
+    float expert_prune_keep_ratio;
     ds4_think_mode think_mode;
     bool head_test;
     bool first_token_test;
@@ -112,6 +117,8 @@ static void usage(FILE *fp) {
         "      Apply steering after FFN outputs: y -= F*v*dot(v,y). Default with file: 1\n"
         "  --dir-steering-attn F\n"
         "      Apply steering after attention outputs. Default: 0\n"
+        "  --expert-mask FILE\n"
+        "      Load a ds4-expert-mask-v1 JSON keep-list and avoid pruned experts in CPU/CUDA routing.\n"
         "  --warm-weights\n"
         "      Touch mapped tensor pages before generation. Slower startup, fewer first-use stalls.\n"
         "  --power N\n"
@@ -178,6 +185,16 @@ static void usage(FILE *fp) {
         "      Stop imatrix collection after N prompts. Default: no prompt limit\n"
         "  --imatrix-max-tokens N\n"
         "      Stop imatrix collection after N prompt tokens. Default: no token limit\n"
+        "  --expert-prune-dataset FILE\n"
+        "      Text calibration dataset for OMP-style expert mask generation. For C4, provide extracted text.\n"
+        "  --expert-prune-out FILE\n"
+        "      Write ds4-expert-mask-v1 JSON with each layer keeping --expert-prune-keep-ratio of experts.\n"
+        "  --expert-prune-max-prompts N\n"
+        "      Stop expert-prune calibration after N prompts. Default: no prompt limit\n"
+        "  --expert-prune-max-tokens N\n"
+        "      Stop expert-prune calibration after N prompt tokens. Default: no token limit\n"
+        "  --expert-prune-keep-ratio F\n"
+        "      Per-layer expert keep ratio for generated mask. Default: 0.875 (keep 7/8)\n"
         "  --head-test\n"
         "      Run the output HC/logits head after the native slice.\n"
         "  --first-token-test\n"
@@ -1423,6 +1440,7 @@ static cli_config parse_options(int argc, char **argv) {
             .top_p = DS4_DEFAULT_TOP_P,
             .min_p = DS4_DEFAULT_MIN_P,
             .dump_logprobs_top_k = 20,
+            .expert_prune_keep_ratio = 0.875f,
             .think_mode = DS4_THINK_HIGH,
         },
     };
@@ -1484,6 +1502,8 @@ static cli_config parse_options(int argc, char **argv) {
         } else if (!strcmp(arg, "--dir-steering-attn")) {
             c.engine.directional_steering_attn = parse_float_range(need_arg(&i, argc, argv, arg), arg, -100.0f, 100.0f);
             directional_steering_scale_set = true;
+        } else if (!strcmp(arg, "--expert-mask")) {
+            c.engine.expert_mask_file = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "-t") || !strcmp(arg, "--threads")) {
             c.engine.n_threads = parse_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--backend")) {
@@ -1513,6 +1533,16 @@ static cli_config parse_options(int argc, char **argv) {
             c.gen.imatrix_max_prompts = parse_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--imatrix-max-tokens")) {
             c.gen.imatrix_max_tokens = parse_int(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--expert-prune-dataset")) {
+            c.gen.expert_prune_dataset_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--expert-prune-out")) {
+            c.gen.expert_prune_output_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--expert-prune-max-prompts")) {
+            c.gen.expert_prune_max_prompts = parse_int(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--expert-prune-max-tokens")) {
+            c.gen.expert_prune_max_tokens = parse_int(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--expert-prune-keep-ratio")) {
+            c.gen.expert_prune_keep_ratio = parse_float_range(need_arg(&i, argc, argv, arg), arg, 0.01f, 1.0f);
         } else if (!strcmp(arg, "--think")) {
             c.gen.think_mode = DS4_THINK_HIGH;
         } else if (!strcmp(arg, "--think-max")) {
@@ -1560,6 +1590,18 @@ static cli_config parse_options(int argc, char **argv) {
         fprintf(stderr, "ds4: --imatrix-dataset requires --imatrix-out\n");
         exit(2);
     }
+    if (c.gen.expert_prune_output_path && !c.gen.expert_prune_dataset_path) {
+        fprintf(stderr, "ds4: --expert-prune-out requires --expert-prune-dataset\n");
+        exit(2);
+    }
+    if (c.gen.expert_prune_dataset_path && !c.gen.expert_prune_output_path) {
+        fprintf(stderr, "ds4: --expert-prune-dataset requires --expert-prune-out\n");
+        exit(2);
+    }
+    if (c.gen.expert_prune_output_path && c.engine.expert_mask_file) {
+        fprintf(stderr, "ds4: --expert-prune-out generates a mask and should not be combined with --expert-mask\n");
+        exit(2);
+    }
     if (c.gen.perplexity_file_path && c.gen.prompt) {
         fprintf(stderr, "ds4: --perplexity-file does not use -p/--prompt-file\n");
         exit(2);
@@ -1602,6 +1644,14 @@ int main(int argc, char **argv) {
                                         cfg.gen.ctx_size,
                                         cfg.gen.imatrix_max_prompts,
                                         cfg.gen.imatrix_max_tokens);
+    } else if (cfg.gen.expert_prune_output_path) {
+        rc = ds4_engine_collect_expert_prune_mask(engine,
+                                                 cfg.gen.expert_prune_dataset_path,
+                                                 cfg.gen.expert_prune_output_path,
+                                                 cfg.gen.ctx_size,
+                                                 cfg.gen.expert_prune_max_prompts,
+                                                 cfg.gen.expert_prune_max_tokens,
+                                                 cfg.gen.expert_prune_keep_ratio);
     } else if (cfg.gen.perplexity_file_path) {
         rc = run_perplexity_file(engine, &cfg);
     } else if (cfg.gen.prompt == NULL) {

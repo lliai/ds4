@@ -101,6 +101,8 @@ next sections.
   imatrix collection, quantization tooling, and quality checks.
 - [gguf-tools/imatrix/README.md](gguf-tools/imatrix/README.md): how the
   routed-MoE imatrix is collected and used.
+- [gguf-tools/expert-prune/README.md](gguf-tools/expert-prune/README.md): how
+  to build a C4 calibration file and generate a 7/8 routed-expert keep mask.
 - [gguf-tools/imatrix/dataset/README.md](gguf-tools/imatrix/dataset/README.md):
   how the calibration prompt corpus is generated.
 - [gguf-tools/quality-testing/README.md](gguf-tools/quality-testing/README.md):

@@ -11,6 +11,8 @@ The important pieces are:
   `q8_0`, `q4_K`, `q2_K`, and `iq2_xxs`.
 - `imatrix/`: dataset and instructions for collecting routed-MoE activation
   importance with `ds4`.
+- `expert-prune/`: C4 calibration helper and commands for generating
+  shape-preserving `ds4-expert-mask-v1` routed-expert keep-lists.
 - `quality-testing/`: prompts and scripts used to compare local GGUF variants
   against official DeepSeek V4 Flash continuations.
 
@@ -121,6 +123,32 @@ importance[column] = sum(row[column]^2) over all rows
 This is a weight-energy heuristic.  It is not as good as measuring real DS4
 activations, but it gives the quantizer a stable column weighting and was good
 enough for the first working 2-bit GGUFs.
+
+## Generate An Expert-Prune Mask
+
+DS4 also has an OMP-style routed-expert mask experiment. It keeps the GGUF shape
+unchanged, collects calibration statistics from C4 text, and writes a
+`ds4-expert-mask-v1` JSON keep-list. For the common Flash 7/8 experiment:
+
+```sh
+python3 gguf-tools/expert-prune/build_c4_prune_dataset.py \
+  --out /tmp/ds4-c4-prune.txt \
+  --max-docs 512 \
+  --max-chars-per-doc 8192
+
+./ds4 --cuda \
+  -m ds4flash.gguf \
+  --expert-prune-dataset /tmp/ds4-c4-prune.txt \
+  --expert-prune-out /tmp/ds4-c4-keep7of8.json \
+  --expert-prune-keep-ratio 0.875 \
+  --expert-prune-max-tokens 131072 \
+  --ctx 32768
+```
+
+Use the resulting mask with `--expert-mask /tmp/ds4-c4-keep7of8.json` on the
+CPU/CUDA runtime surfaces. This is runtime masking, not structural GGUF
+shrinking; it preserves `deepseek4.expert_count` and does not reduce model file
+size.
 
 ## Quality Testing
 

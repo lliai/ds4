@@ -1191,6 +1191,7 @@ typedef struct {
 typedef struct {
     const char *model_path;
     const char *mtp_path;
+    const char *expert_mask_file;
     const char *trace_path;
     const char *regrade_trace_path;
     ds4_backend backend;
@@ -1493,6 +1494,7 @@ static void usage(FILE *fp) {
         "  --metal | --cuda | --cpu | --backend NAME\n"
         "  -t, --threads N        CPU helper threads.\n"
         "  --quality              Prefer exact kernels where applicable.\n"
+        "  --expert-mask FILE     Load a ds4-expert-mask-v1 JSON keep-list.\n"
         "  --warm-weights         Touch mapped tensor pages before evaluation.\n"
         "  --power N              Target GPU duty cycle percentage, 1..100. Default: 100\n"
         "\n"
@@ -1585,6 +1587,8 @@ static eval_config parse_options(int argc, char **argv) {
             c.backend = DS4_BACKEND_CPU;
         } else if (!strcmp(arg, "--quality")) {
             c.quality = true;
+        } else if (!strcmp(arg, "--expert-mask")) {
+            c.expert_mask_file = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--power")) {
             c.power_percent = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
             if (c.power_percent < 1 || c.power_percent > 100) {
@@ -3768,6 +3772,7 @@ int main(int argc, char **argv) {
         .n_threads = cfg.threads,
         .mtp_draft_tokens = 1,
         .mtp_margin = 3.0f,
+        .expert_mask_file = cfg.expert_mask_file,
         .power_percent = cfg.power_percent,
         .warm_weights = cfg.warm_weights,
         .quality = cfg.quality,

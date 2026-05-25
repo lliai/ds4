@@ -67,6 +67,7 @@ typedef struct {
     int mtp_draft_tokens;
     float mtp_margin;
     const char *directional_steering_file;
+    const char *expert_mask_file;
     float directional_steering_attn;
     float directional_steering_ffn;
     int power_percent;
@@ -129,6 +130,13 @@ int ds4_engine_collect_imatrix(ds4_engine *e,
                                int ctx_size,
                                int max_prompts,
                                int max_tokens);
+int ds4_engine_collect_expert_prune_mask(ds4_engine *e,
+                                         const char *dataset_path,
+                                         const char *output_path,
+                                         int ctx_size,
+                                         int max_prompts,
+                                         int max_tokens,
+                                         float keep_ratio);
 void ds4_engine_dump_tokens(ds4_engine *e, const ds4_tokens *tokens);
 int ds4_dump_text_tokenization(const char *model_path, const char *text, FILE *fp);
 int ds4_engine_head_test(ds4_engine *e, const ds4_tokens *prompt);

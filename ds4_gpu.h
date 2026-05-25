@@ -614,6 +614,7 @@ int ds4_gpu_router_select_tensor(
         uint32_t                n_group_used,
         bool                    has_bias,
         bool                    hash_mode,
+        const uint8_t          *expert_mask,
         const ds4_gpu_tensor *logits);
 
 int ds4_gpu_router_select_batch_tensor(
@@ -631,6 +632,7 @@ int ds4_gpu_router_select_batch_tensor(
         bool                    hash_mode,
         const ds4_gpu_tensor *logits,
         const ds4_gpu_tensor *tokens,
+        const uint8_t          *expert_mask,
         uint32_t                n_expert,
         uint32_t                n_expert_used,
         float                   expert_weight_scale,

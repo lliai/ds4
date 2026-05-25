@@ -585,6 +585,12 @@ typedef struct {
 typedef ds4_tokens token_vec;
 
 typedef struct {
+    bool loaded;
+    uint32_t keep_count[DS4_MAX_LAYER];
+    uint8_t keep[DS4_MAX_LAYER][DS4_MAX_EXPERT];
+} ds4_expert_mask;
+
+typedef struct {
     const uint8_t *base;
     uint64_t size;
     uint64_t pos;
@@ -1737,6 +1743,204 @@ static bool accelerator_cache_model_tensors(ds4_backend backend, const ds4_model
 /* Return the in-place tensor payload inside the mapped GGUF. */
 static const void *tensor_data(const ds4_model *m, const ds4_tensor *t) {
     return m->map + t->abs_offset;
+}
+
+static const uint8_t *expert_mask_for_layer(const ds4_expert_mask *mask, uint32_t il) {
+    if (!mask || !mask->loaded || il >= DS4_N_LAYER) return NULL;
+    if (mask->keep_count[il] >= DS4_N_EXPERT) return NULL;
+    return mask->keep[il];
+}
+
+static bool expert_mask_keeps(const ds4_expert_mask *mask, uint32_t il, uint32_t expert) {
+    const uint8_t *row = expert_mask_for_layer(mask, il);
+    if (!row || expert >= DS4_N_EXPERT) return true;
+    return row[expert] != 0;
+}
+
+static bool ds4_read_whole_text_file(const char *path, const char *label, char **out, size_t *len_out) {
+    if (out) *out = NULL;
+    if (len_out) *len_out = 0;
+    if (!path || !out || !len_out) return false;
+
+    struct stat st;
+    if (stat(path, &st) != 0) {
+        fprintf(stderr, "ds4: failed to stat %s %s: %s\n", label ? label : "file", path, strerror(errno));
+        return false;
+    }
+    if (st.st_size < 0 || (uint64_t)st.st_size > SIZE_MAX - 1) {
+        fprintf(stderr, "ds4: %s is too large: %s\n", label ? label : "file", path);
+        return false;
+    }
+
+    FILE *fp = fopen(path, "rb");
+    if (!fp) {
+        fprintf(stderr, "ds4: failed to open %s %s: %s\n", label ? label : "file", path, strerror(errno));
+        return false;
+    }
+
+    const size_t n = (size_t)st.st_size;
+    char *buf = xmalloc(n + 1);
+    if (n != 0 && fread(buf, 1, n, fp) != n) {
+        fprintf(stderr, "ds4: failed to read %s %s\n", label ? label : "file", path);
+        fclose(fp);
+        free(buf);
+        return false;
+    }
+    if (fclose(fp) != 0) {
+        fprintf(stderr, "ds4: failed to close %s %s: %s\n", label ? label : "file", path, strerror(errno));
+        free(buf);
+        return false;
+    }
+    buf[n] = '\0';
+    *out = buf;
+    *len_out = n;
+    return true;
+}
+
+static bool json_u32_after_key(const char *json, const char *key, uint32_t *out) {
+    char pat[96];
+    snprintf(pat, sizeof(pat), "\"%s\"", key);
+    const char *p = strstr(json, pat);
+    if (!p) return false;
+    p = strchr(p + strlen(pat), ':');
+    if (!p) return false;
+    p++;
+    while (*p && isspace((unsigned char)*p)) p++;
+    char *end = NULL;
+    unsigned long v = strtoul(p, &end, 10);
+    if (end == p || v > UINT32_MAX) return false;
+    *out = (uint32_t)v;
+    return true;
+}
+
+static bool expert_mask_load_json(ds4_expert_mask *mask, const char *path) {
+    if (!mask || !path || !path[0]) return true;
+
+    char *json = NULL;
+    size_t len = 0;
+    if (!ds4_read_whole_text_file(path, "expert mask", &json, &len)) return false;
+    (void)len;
+
+    bool ok = true;
+    memset(mask, 0, sizeof(*mask));
+    if (!strstr(json, "\"ds4-expert-mask-v1\"")) {
+        fprintf(stderr, "ds4: expert mask %s does not look like ds4-expert-mask-v1 JSON\n", path);
+        ok = false;
+        goto done;
+    }
+
+    uint32_t got = 0;
+    if (json_u32_after_key(json, "n_layer", &got) && got != DS4_N_LAYER) {
+        fprintf(stderr, "ds4: expert mask layer count mismatch: file=%u model=%u\n", got, DS4_N_LAYER);
+        ok = false;
+        goto done;
+    }
+    if (json_u32_after_key(json, "n_expert", &got) && got != DS4_N_EXPERT) {
+        fprintf(stderr, "ds4: expert mask expert count mismatch: file=%u model=%u\n", got, DS4_N_EXPERT);
+        ok = false;
+        goto done;
+    }
+
+    const char *layers = strstr(json, "\"layers\"");
+    if (!layers) {
+        fprintf(stderr, "ds4: expert mask %s is missing layers[]\n", path);
+        ok = false;
+        goto done;
+    }
+    const char *p = strchr(layers, '[');
+    if (!p) {
+        fprintf(stderr, "ds4: expert mask %s has malformed layers[]\n", path);
+        ok = false;
+        goto done;
+    }
+
+    bool seen[DS4_MAX_LAYER] = { false };
+    while ((p = strstr(p, "\"layer\"")) != NULL) {
+        const char *colon = strchr(p, ':');
+        if (!colon) {
+            ok = false;
+            break;
+        }
+        char *num_end = NULL;
+        unsigned long layer_ul = strtoul(colon + 1, &num_end, 10);
+        if (num_end == colon + 1 || layer_ul >= DS4_N_LAYER) {
+            fprintf(stderr, "ds4: expert mask %s contains invalid layer id near byte %td\n",
+                    path, p - json);
+            ok = false;
+            break;
+        }
+        const uint32_t il = (uint32_t)layer_ul;
+
+        const char *keep_key = strstr(num_end, "\"keep\"");
+        if (!keep_key) {
+            fprintf(stderr, "ds4: expert mask %s layer %u is missing keep[]\n", path, il);
+            ok = false;
+            break;
+        }
+        const char *arr = strchr(keep_key, '[');
+        if (!arr) {
+            fprintf(stderr, "ds4: expert mask %s layer %u has malformed keep[]\n", path, il);
+            ok = false;
+            break;
+        }
+        arr++;
+
+        memset(mask->keep[il], 0, DS4_MAX_EXPERT);
+        uint32_t count = 0;
+        while (*arr) {
+            while (*arr && (isspace((unsigned char)*arr) || *arr == ',')) arr++;
+            if (*arr == ']') {
+                arr++;
+                break;
+            }
+            char *endp = NULL;
+            long v = strtol(arr, &endp, 10);
+            if (endp == arr || v < 0 || v >= (long)DS4_N_EXPERT) {
+                fprintf(stderr, "ds4: expert mask %s layer %u has invalid expert id near byte %td\n",
+                        path, il, arr - json);
+                ok = false;
+                break;
+            }
+            if (!mask->keep[il][v]) {
+                mask->keep[il][v] = 1;
+                count++;
+            }
+            arr = endp;
+        }
+        if (!ok) break;
+        if (count < DS4_N_EXPERT_USED) {
+            fprintf(stderr,
+                    "ds4: expert mask %s layer %u keeps only %u experts, fewer than router top-k %u\n",
+                    path, il, count, DS4_N_EXPERT_USED);
+            ok = false;
+            break;
+        }
+        mask->keep_count[il] = count;
+        seen[il] = true;
+        p = arr;
+    }
+    if (ok) {
+        for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+            if (!seen[il]) {
+                fprintf(stderr, "ds4: expert mask %s is missing layer %u\n", path, il);
+                ok = false;
+                break;
+            }
+        }
+    }
+    if (ok) {
+        mask->loaded = true;
+        fprintf(stderr,
+                "ds4: loaded expert mask %s (layers=%u experts=%u top_k=%u)\n",
+                path,
+                DS4_N_LAYER,
+                DS4_N_EXPERT,
+                DS4_N_EXPERT_USED);
+    }
+
+done:
+    free(json);
+    return ok;
 }
 
 /* Optional startup pass that touches tensor pages before timing generation. */
@@ -5592,7 +5796,9 @@ static void layer_hash_selected_experts(
         int                    selected[DS4_MAX_EXPERT_USED],
         const ds4_model       *model,
         const ds4_layer_weights *layer,
-        int                    token) {
+        int                    token,
+        const ds4_expert_mask *expert_mask,
+        uint32_t               il) {
     ds4_tensor *t = layer->ffn_gate_tid2eid;
     if (!t) ds4_die("hash routing table is missing for this layer");
     if (t->type != 26 || t->ndim != 2 || t->dim[0] != DS4_N_EXPERT_USED) {
@@ -5604,7 +5810,31 @@ static void layer_hash_selected_experts(
 
     const int32_t *table = tensor_data(model, t);
     const int32_t *row = table + (uint64_t)token * DS4_N_EXPERT_USED;
-    for (uint32_t i = 0; i < DS4_N_EXPERT_USED; i++) selected[i] = row[i];
+    bool all_kept = true;
+    for (uint32_t i = 0; i < DS4_N_EXPERT_USED; i++) {
+        selected[i] = row[i];
+        if (row[i] < 0 || !expert_mask_keeps(expert_mask, il, (uint32_t)row[i])) all_kept = false;
+    }
+    if (all_kept) return;
+
+    uint32_t n = 0;
+    for (uint32_t i = 0; i < DS4_N_EXPERT_USED; i++) {
+        if (row[i] >= 0 && expert_mask_keeps(expert_mask, il, (uint32_t)row[i])) {
+            selected[n++] = row[i];
+        }
+    }
+    for (uint32_t e = 0; n < DS4_N_EXPERT_USED && e < DS4_N_EXPERT; e++) {
+        if (!expert_mask_keeps(expert_mask, il, e)) continue;
+        bool already = false;
+        for (uint32_t i = 0; i < n; i++) {
+            if ((uint32_t)selected[i] == e) {
+                already = true;
+                break;
+            }
+        }
+        if (!already) selected[n++] = (int)e;
+    }
+    if (n < DS4_N_EXPERT_USED) ds4_die("expert mask leaves fewer experts than router top-k");
 }
 
 /* Router scores use sqrt(softplus(logit)); normalization happens only after
@@ -5651,10 +5881,11 @@ static void layer_hash_router_weights_one(
     layer_hash_router_weights_from_probs(weights_out, probs, selected);
 }
 
-static void topk_desc(const float *score, int n, int k, int *idx) {
+static void topk_desc_masked(const float *score, int n, int k, int *idx, const uint8_t *mask) {
     for (int i = 0; i < k; i++) idx[i] = -1;
 
     for (int i = 0; i < n; i++) {
+        if (mask && mask[i] == 0) continue;
         for (int j = 0; j < k; j++) {
             if (idx[j] < 0 || score[i] > score[idx[j]]) {
                 for (int m = k - 1; m > j; m--) idx[m] = idx[m - 1];
@@ -5662,6 +5893,9 @@ static void topk_desc(const float *score, int n, int k, int *idx) {
                 break;
             }
         }
+    }
+    for (int i = 0; i < k; i++) {
+        if (idx[i] < 0) ds4_die("expert mask leaves fewer experts than router top-k");
     }
 }
 
@@ -5672,18 +5906,22 @@ static void layer_topk_selected_experts_from_probs(
         float                  expert_weight[DS4_MAX_EXPERT_USED],
         const ds4_model       *model,
         const ds4_layer_weights *layer,
-        const float           probs[DS4_MAX_EXPERT]);
+        const float           probs[DS4_MAX_EXPERT],
+        const ds4_expert_mask *expert_mask,
+        uint32_t              il);
 
 static void layer_topk_selected_experts(
         int                    selected[DS4_MAX_EXPERT_USED],
         float                  expert_weight[DS4_MAX_EXPERT_USED],
         const ds4_model       *model,
         const ds4_layer_weights *layer,
-        const float           *x) {
+        const float           *x,
+        const ds4_expert_mask *expert_mask,
+        uint32_t              il) {
     float probs[DS4_MAX_EXPERT];
 
     layer_router_probs_one(probs, model, layer, x);
-    layer_topk_selected_experts_from_probs(selected, expert_weight, model, layer, probs);
+    layer_topk_selected_experts_from_probs(selected, expert_weight, model, layer, probs, expert_mask, il);
 }
 
 static void layer_topk_selected_experts_from_probs(
@@ -5691,7 +5929,9 @@ static void layer_topk_selected_experts_from_probs(
         float                  expert_weight[DS4_MAX_EXPERT_USED],
         const ds4_model       *model,
         const ds4_layer_weights *layer,
-        const float           probs[DS4_MAX_EXPERT]) {
+        const float           probs[DS4_MAX_EXPERT],
+        const ds4_expert_mask *expert_mask,
+        uint32_t              il) {
     float selection[DS4_MAX_EXPERT];
 
     memcpy(selection, probs, sizeof(selection));
@@ -5701,7 +5941,8 @@ static void layer_topk_selected_experts_from_probs(
         for (uint32_t i = 0; i < DS4_N_EXPERT; i++) selection[i] += bias[i];
     }
 
-    topk_desc(selection, (int)DS4_N_EXPERT, (int)DS4_N_EXPERT_USED, selected);
+    topk_desc_masked(selection, (int)DS4_N_EXPERT, (int)DS4_N_EXPERT_USED, selected,
+                     expert_mask_for_layer(expert_mask, il));
 
     float sum = 0.0f;
     for (uint32_t i = 0; i < DS4_N_EXPERT_USED; i++) {
@@ -5726,7 +5967,8 @@ static void layer_routed_moe_one(
         uint32_t            il,
         int                 token,
         float               clamp,
-        bool                trace) {
+        bool                trace,
+        const ds4_expert_mask *expert_mask) {
     int selected[DS4_MAX_EXPERT_USED];
     float expert_weight[DS4_MAX_EXPERT_USED];
     float *gate = trace ? xmalloc((size_t)DS4_N_FF_EXP * sizeof(gate[0])) : NULL;
@@ -5745,10 +5987,10 @@ static void layer_routed_moe_one(
     ds4_quantize_row_q8_K(x, xq, (int64_t)expert_in_dim);
 
     if (layer->ffn_gate_tid2eid) {
-        layer_hash_selected_experts(selected, model, layer, token);
+        layer_hash_selected_experts(selected, model, layer, token, expert_mask, il);
         layer_hash_router_weights_one(expert_weight, model, layer, x, selected);
     } else {
-        layer_topk_selected_experts(selected, expert_weight, model, layer, x);
+        layer_topk_selected_experts(selected, expert_weight, model, layer, x, expert_mask, il);
     }
 
     if (!trace) {
@@ -5826,7 +6068,8 @@ static void layer_routed_moe_one_prealloc(
         float               clamp,
         float              * mid_all,
         block_q8_K         * xq,
-        block_q8_K         * midq) {
+        block_q8_K         * midq,
+        const ds4_expert_mask *expert_mask) {
     int selected[DS4_MAX_EXPERT_USED];
     float expert_weight[DS4_MAX_EXPERT_USED];
     const uint64_t expert_in_dim = layer->ffn_gate_exps->dim[0];
@@ -5839,10 +6082,10 @@ static void layer_routed_moe_one_prealloc(
     ds4_quantize_row_q8_K(x, xq, (int64_t)expert_in_dim);
 
     if (layer->ffn_gate_tid2eid) {
-        layer_hash_selected_experts(selected, model, layer, token);
+        layer_hash_selected_experts(selected, model, layer, token, expert_mask, il);
         layer_hash_router_weights_one(expert_weight, model, layer, x, selected);
     } else {
-        layer_topk_selected_experts(selected, expert_weight, model, layer, x);
+        layer_topk_selected_experts(selected, expert_weight, model, layer, x, expert_mask, il);
     }
 
     matvec_iq2_xxs_experts_mid_prequant(mid_all, model,
@@ -5874,7 +6117,8 @@ static void layer_routed_moe_batch(
         const int         * token_ids,
         uint32_t            n_tok,
         uint32_t            il,
-        float               clamp) {
+        float               clamp,
+        const ds4_expert_mask *expert_mask) {
     const uint64_t expert_in_dim = layer->ffn_gate_exps->dim[0];
     const uint64_t expert_out_dim = layer->ffn_gate_exps->dim[1];
     const uint64_t down_in_dim = layer->ffn_down_exps->dim[0];
@@ -5905,10 +6149,11 @@ static void layer_routed_moe_batch(
         int sel[DS4_MAX_EXPERT_USED];
         float weights[DS4_MAX_EXPERT_USED];
         if (layer->ffn_gate_tid2eid) {
-            layer_hash_selected_experts(sel, model, layer, token_ids[t]);
+            layer_hash_selected_experts(sel, model, layer, token_ids[t], expert_mask, il);
             layer_hash_router_weights_one(weights, model, layer, norm + (uint64_t)t * expert_in_dim, sel);
         } else {
-            layer_topk_selected_experts(sel, weights, model, layer, norm + (uint64_t)t * expert_in_dim);
+            layer_topk_selected_experts(sel, weights, model, layer, norm + (uint64_t)t * expert_in_dim,
+                                        expert_mask, il);
         }
 
         for (uint32_t slot = 0; slot < DS4_N_EXPERT_USED; slot++) {
@@ -6025,7 +6270,8 @@ static void layer_ffn_one(
         int                 token,
         const float       * steering_dirs,
         float               steering_scale,
-        bool                trace) {
+        bool                trace,
+        const ds4_expert_mask *expert_mask) {
     const uint32_t n_hc = DS4_N_HC;
     const bool profile = getenv("DS4_DECODE_PROFILE_DETAIL") != NULL;
     const double t_start = profile ? now_sec() : 0.0;
@@ -6066,7 +6312,8 @@ static void layer_ffn_one(
     }
 
     t0 = profile ? now_sec() : 0.0;
-    layer_routed_moe_one(moe, model, layer, norm, il, token, DS4_SWIGLU_CLAMP_EXP, trace);
+    layer_routed_moe_one(moe, model, layer, norm, il, token, DS4_SWIGLU_CLAMP_EXP, trace,
+                         expert_mask);
     if (profile) t_routed = now_sec() - t0;
     if (trace) {
         char name[64];
@@ -6130,7 +6377,8 @@ static void layer_ffn_one_decode_scratch(
         int                      token,
         const float            * steering_dirs,
         float                    steering_scale,
-        ds4_cpu_decode_scratch * scratch) {
+        ds4_cpu_decode_scratch * scratch,
+        const ds4_expert_mask  * expert_mask) {
     const uint32_t n_hc = DS4_N_HC;
     const bool profile = getenv("DS4_DECODE_PROFILE_DETAIL") != NULL;
     const double t_start = profile ? now_sec() : 0.0;
@@ -6167,7 +6415,8 @@ static void layer_ffn_one_decode_scratch(
                                   DS4_SWIGLU_CLAMP_EXP,
                                   scratch->routed_mid_all,
                                   scratch->routed_xq,
-                                  scratch->routed_midq);
+                                  scratch->routed_midq,
+                                  expert_mask);
     if (profile) t_routed = now_sec() - t0;
 
     t0 = profile ? now_sec() : 0.0;
@@ -6204,7 +6453,8 @@ static void layer_ffn_batch(
         uint32_t            n_tok,
         uint32_t            il,
         const float       * steering_dirs,
-        float               steering_scale) {
+        float               steering_scale,
+        const ds4_expert_mask *expert_mask) {
     if (n_tok == 0) return;
     const uint32_t n_hc = DS4_N_HC;
     const uint64_t hc_dim = (uint64_t)n_hc * DS4_N_EMBD;
@@ -6232,7 +6482,8 @@ static void layer_ffn_batch(
                         DS4_RMS_EPS);
     }
 
-    layer_routed_moe_batch(moe, model, layer, norm, token_ids, n_tok, il, DS4_SWIGLU_CLAMP_EXP);
+    layer_routed_moe_batch(moe, model, layer, norm, token_ids, n_tok, il, DS4_SWIGLU_CLAMP_EXP,
+                           expert_mask);
     layer_shared_ffn_batch(shared, model, layer, norm, n_tok);
 
     if (cpu_directional_steering_enabled(steering_dirs, steering_scale)) {
@@ -6279,6 +6530,7 @@ typedef struct {
     uint64_t expert_in_dim;
     uint64_t down_in_dim;
     uint32_t il;
+    const ds4_expert_mask *expert_mask;
 } routed_moe_tokens_ctx;
 
 static void routed_moe_tokens_worker(void *vctx, uint64_t t0, uint64_t t1) {
@@ -6297,7 +6549,8 @@ static void routed_moe_tokens_worker(void *vctx, uint64_t t0, uint64_t t1) {
                                       DS4_SWIGLU_CLAMP_EXP,
                                       routed_mid,
                                       routed_xq,
-                                      routed_midq);
+                                      routed_midq,
+                                      ctx->expert_mask);
     }
 
     free(routed_midq);
@@ -6312,7 +6565,8 @@ static void layer_routed_moe_tokens_parallel(
         const float       * norm,
         const int         * token_ids,
         uint32_t            n_tok,
-        uint32_t            il) {
+        uint32_t            il,
+        const ds4_expert_mask *expert_mask) {
     routed_moe_tokens_ctx ctx = {
         .moe = moe,
         .model = model,
@@ -6322,6 +6576,7 @@ static void layer_routed_moe_tokens_parallel(
         .expert_in_dim = layer->ffn_gate_exps->dim[0],
         .down_in_dim = layer->ffn_down_exps->dim[0],
         .il = il,
+        .expert_mask = expert_mask,
     };
     ds4_parallel_for_min_rows(n_tok, routed_moe_tokens_worker, &ctx, 1);
 }
@@ -6337,7 +6592,8 @@ static void layer_ffn_shared_batch(
         uint32_t            n_tok,
         uint32_t            il,
         const float       * steering_dirs,
-        float               steering_scale) {
+        float               steering_scale,
+        const ds4_expert_mask *expert_mask) {
     const bool profile = getenv("DS4_PREFILL_PROFILE_DETAIL") != NULL;
     const double t_start = profile ? now_sec() : 0.0;
     double t_hc_norm = 0.0;
@@ -6377,7 +6633,8 @@ static void layer_ffn_shared_batch(
 
     t0 = profile ? now_sec() : 0.0;
     if (routed_token_parallel) {
-        layer_routed_moe_tokens_parallel(moe, model, layer, norm, token_ids, n_tok, il);
+        layer_routed_moe_tokens_parallel(moe, model, layer, norm, token_ids, n_tok, il,
+                                         expert_mask);
     } else {
         for (uint32_t t = 0; t < n_tok; t++) {
             layer_routed_moe_one_prealloc(moe + (uint64_t)t * DS4_N_EMBD,
@@ -6389,7 +6646,8 @@ static void layer_ffn_shared_batch(
                                           DS4_SWIGLU_CLAMP_EXP,
                                           routed_mid,
                                           routed_xq,
-                                          routed_midq);
+                                          routed_midq,
+                                          expert_mask);
         }
     }
     if (profile) t_routed = now_sec() - t0;
@@ -6452,6 +6710,7 @@ typedef struct {
     const int *token_ids;
     const float *steering_dirs;
     float steering_scale;
+    const ds4_expert_mask *expert_mask;
     uint64_t hc_dim;
     uint32_t il;
 } layer_ffn_tokens_ctx;
@@ -6467,7 +6726,8 @@ static void layer_ffn_tokens_worker(void *vctx, uint64_t t0, uint64_t t1) {
                       ctx->token_ids[t],
                       ctx->steering_dirs,
                       ctx->steering_scale,
-                      false);
+                      false,
+                      ctx->expert_mask);
     }
 }
 
@@ -6480,7 +6740,8 @@ static void layer_ffn_tokens_parallel(
         uint32_t            n_tok,
         uint32_t            il,
         const float       * steering_dirs,
-        float               steering_scale) {
+        float               steering_scale,
+        const ds4_expert_mask *expert_mask) {
     layer_ffn_tokens_ctx ctx = {
         .out_hc = out_hc,
         .model = model,
@@ -6489,6 +6750,7 @@ static void layer_ffn_tokens_parallel(
         .token_ids = token_ids,
         .steering_dirs = steering_dirs,
         .steering_scale = steering_scale,
+        .expert_mask = expert_mask,
         .hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD,
         .il = il,
     };
@@ -7897,6 +8159,7 @@ static void layer_forward_raw_swa_one(
         const float             * steering_dirs,
         float                     steering_attn_scale,
         float                     steering_ffn_scale,
+        const ds4_expert_mask   * expert_mask,
         ds4_cpu_decode_scratch  * scratch) {
     const uint32_t n_hc = DS4_N_HC;
     const bool profile = getenv("DS4_DECODE_PROFILE_DETAIL") != NULL;
@@ -8029,7 +8292,7 @@ static void layer_forward_raw_swa_one(
 
     t0 = profile ? now_sec() : 0.0;
     layer_ffn_one_decode_scratch(out_hc, model, layer, scratch->after_attn_hc, il, token,
-                                 steering_dirs, steering_ffn_scale, scratch);
+                                 steering_dirs, steering_ffn_scale, scratch, expert_mask);
     if (profile) t_ffn = now_sec() - t0;
 
     if (profile) {
@@ -8071,6 +8334,7 @@ static void forward_token_raw_swa_cpu_decode_scratch(
         const float       * steering_dirs,
         float               steering_attn_scale,
         float               steering_ffn_scale,
+        const ds4_expert_mask *expert_mask,
         ds4_cpu_decode_scratch * scratch) {
     float *cur = scratch->cur;
     float *next = scratch->next;
@@ -8084,6 +8348,7 @@ static void forward_token_raw_swa_cpu_decode_scratch(
                                   steering_dirs,
                                   steering_attn_scale,
                                   steering_ffn_scale,
+                                  expert_mask,
                                   scratch);
         float *tmp = cur;
         cur = next;
@@ -8114,7 +8379,7 @@ static void forward_token_raw_swa_cpu(
     }
     cpu_decode_scratch_init(&scratch, ctx_guess);
     forward_token_raw_swa_cpu_decode_scratch(logits, model, weights, cache, token, pos,
-                                             NULL, 0.0f, 0.0f, &scratch);
+                                             NULL, 0.0f, 0.0f, NULL, &scratch);
     cpu_decode_scratch_free(&scratch);
 }
 #endif
@@ -8129,7 +8394,8 @@ static void prefill_layer_major_cpu(
         const token_vec   * prompt,
         const float       * steering_dirs,
         float               steering_attn_scale,
-        float               steering_ffn_scale) {
+        float               steering_ffn_scale,
+        const ds4_expert_mask *expert_mask) {
     const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
     const uint64_t n_tok = (uint64_t)prompt->len;
     float *cur = xmalloc((size_t)n_tok * hc_dim * sizeof(cur[0]));
@@ -8183,7 +8449,8 @@ static void prefill_layer_major_cpu(
                                     nb,
                                     il,
                                     steering_dirs,
-                                    steering_ffn_scale);
+                                    steering_ffn_scale,
+                                    expert_mask);
                 }
             } else if (shared_batch_ffn) {
                 layer_ffn_shared_batch(next,
@@ -8194,7 +8461,8 @@ static void prefill_layer_major_cpu(
                                        (uint32_t)n_tok,
                                        il,
                                        steering_dirs,
-                                       steering_ffn_scale);
+                                       steering_ffn_scale,
+                                       expert_mask);
             } else if (parallel_ffn) {
                 layer_ffn_tokens_parallel(next,
                                           model,
@@ -8204,7 +8472,8 @@ static void prefill_layer_major_cpu(
                                           (uint32_t)n_tok,
                                           il,
                                           steering_dirs,
-                                          steering_ffn_scale);
+                                          steering_ffn_scale,
+                                          expert_mask);
             } else {
                 for (uint64_t t = 0; t < n_tok; t++) {
                     layer_ffn_one(next + t * hc_dim,
@@ -8215,7 +8484,8 @@ static void prefill_layer_major_cpu(
                                   prompt->v[t],
                                   steering_dirs,
                                   steering_ffn_scale,
-                                  false);
+                                  false,
+                                  expert_mask);
                 }
             }
         } else if (batched_ffn) {
@@ -8241,7 +8511,8 @@ static void prefill_layer_major_cpu(
                                 nb,
                                 il,
                                 steering_dirs,
-                                steering_ffn_scale);
+                                steering_ffn_scale,
+                                expert_mask);
             }
         } else {
             if (!decode_scratch_ready) {
@@ -8260,6 +8531,7 @@ static void prefill_layer_major_cpu(
                                           steering_dirs,
                                           steering_attn_scale,
                                           steering_ffn_scale,
+                                          expert_mask,
                                           &decode_scratch);
             }
         }
@@ -8326,7 +8598,7 @@ static void layer_forward_self_one(
     hc_post_one(after_attn_hc, attn_out, attn_residual, post, comb, DS4_N_EMBD, n_hc);
 
     layer_ffn_one(out_hc, model, layer, after_attn_hc, il, token,
-                  NULL, 0.0f, false);
+                  NULL, 0.0f, false, NULL);
 
     free(after_attn_hc);
     free(attn_out);
@@ -8676,6 +8948,7 @@ typedef struct {
     bool batch_routed_mid_is_f16;
     ds4_gpu_tensor *batch_ffn_out;
     bool materialize_ffn_out;
+    const ds4_expert_mask *expert_mask;
     ds4_gpu_tensor *directional_steering_dirs;
     float directional_steering_attn_scale;
     float directional_steering_ffn_scale;
@@ -10463,6 +10736,7 @@ static bool metal_graph_encode_decode_layer(
                                                 0,
                                                 layer->ffn_exp_probs_b != NULL,
                                                 layer->ffn_gate_tid2eid != NULL,
+                                                expert_mask_for_layer(g->expert_mask, il),
                                                 g->router_logits) != 0;
     DS4_METAL_PROFILE_DECODE_STAGE("router");
     if (ok) {
@@ -10934,12 +11208,13 @@ static void metal_graph_trace_layer_stages(
                                   DS4_SWIGLU_CLAMP_EXP,
                                   routed_mid_all,
                                   routed_xq,
-                                  routed_midq);
+                                  routed_midq,
+                                  NULL);
     if (layer->ffn_gate_tid2eid) {
-        layer_hash_selected_experts(selected, model, layer, token);
+        layer_hash_selected_experts(selected, model, layer, token, NULL, il);
         layer_hash_router_weights_one(expert_weight, model, layer, cpu_ffn_norm, selected);
     } else {
-        layer_topk_selected_experts(selected, expert_weight, model, layer, cpu_ffn_norm);
+        layer_topk_selected_experts(selected, expert_weight, model, layer, cpu_ffn_norm, NULL, il);
     }
     for (uint32_t i = 0; i < DS4_N_EMBD; i++) cpu_ffn_out[i] = cpu_shared[i] + cpu_routed[i];
     hc_post_one(cpu_after_ffn_hc, cpu_ffn_out, cpu_after_attn_hc, ffn_post, ffn_comb, DS4_N_EMBD, DS4_N_HC);
@@ -11158,12 +11433,13 @@ static int metal_graph_decode_test(
                                   DS4_SWIGLU_CLAMP_EXP,
                                   routed_mid_all,
                                   routed_xq,
-                                  routed_midq);
+                                  routed_midq,
+                                  NULL);
     if (layer->ffn_gate_tid2eid) {
-        layer_hash_selected_experts(selected, model, layer, token);
+        layer_hash_selected_experts(selected, model, layer, token, NULL, 0);
         layer_hash_router_weights_one(expert_weight, model, layer, cpu_ffn_norm, selected);
     } else {
-        layer_topk_selected_experts(selected, expert_weight, model, layer, cpu_ffn_norm);
+        layer_topk_selected_experts(selected, expert_weight, model, layer, cpu_ffn_norm, NULL, 0);
     }
     for (uint32_t i = 0; i < DS4_N_EMBD; i++) cpu_ffn_out[i] = cpu_shared[i] + cpu_routed[i];
     hc_post_one(cpu_after_ffn_hc,
@@ -13296,6 +13572,7 @@ static bool metal_graph_encode_layer_ffn_batch(
                                                       layer->ffn_gate_tid2eid != NULL,
                                                       g->batch_router_logits,
                                                       g->prefill_tokens,
+                                                      expert_mask_for_layer(g->expert_mask, il),
                                                       DS4_N_EXPERT,
                                                       DS4_N_EXPERT_USED,
                                                       DS4_EXPERT_WEIGHT_SCALE,
@@ -13900,6 +14177,274 @@ static bool imatrix_collector_save(
     return true;
 }
 
+typedef struct {
+    double *y_norm;       /* [layer] */
+    double *y_dot_v;      /* [layer][expert] */
+    double *v_norm;       /* [layer][expert] */
+    double *v_dot;        /* [layer][expert][expert] */
+    uint64_t *route_count;/* [layer][expert] */
+    float *y_buf;
+    float *down_buf;
+    int *selected_buf;
+    uint32_t cap_tokens;
+    uint64_t observed_tokens;
+    uint64_t observed_routes;
+    uint32_t chunks;
+    float keep_ratio;
+    const char *dataset_path;
+} ds4_expert_prune_collector;
+
+static size_t prune_layer_expert_off(uint32_t il, uint32_t expert) {
+    return ((size_t)il * DS4_N_EXPERT) + expert;
+}
+
+static bool expert_prune_collector_init(
+        ds4_expert_prune_collector *c,
+        uint32_t                    cap_tokens,
+        float                       keep_ratio,
+        const char                 *dataset_path) {
+    memset(c, 0, sizeof(*c));
+    c->cap_tokens = cap_tokens ? cap_tokens : 1u;
+    c->keep_ratio = keep_ratio;
+    c->dataset_path = dataset_path;
+    c->y_norm = xcalloc((size_t)DS4_N_LAYER, sizeof(c->y_norm[0]));
+    c->y_dot_v = xcalloc((size_t)DS4_N_LAYER * DS4_N_EXPERT, sizeof(c->y_dot_v[0]));
+    c->v_norm = xcalloc((size_t)DS4_N_LAYER * DS4_N_EXPERT, sizeof(c->v_norm[0]));
+    c->v_dot = xcalloc((size_t)DS4_N_LAYER * DS4_N_EXPERT * DS4_N_EXPERT, sizeof(c->v_dot[0]));
+    c->route_count = xcalloc((size_t)DS4_N_LAYER * DS4_N_EXPERT, sizeof(c->route_count[0]));
+    c->y_buf = xmalloc((size_t)c->cap_tokens * DS4_N_EMBD * sizeof(c->y_buf[0]));
+    c->down_buf = xmalloc((size_t)c->cap_tokens * DS4_N_EXPERT_USED * DS4_N_EMBD * sizeof(c->down_buf[0]));
+    c->selected_buf = xmalloc((size_t)c->cap_tokens * DS4_N_EXPERT_USED * sizeof(c->selected_buf[0]));
+    return c->y_norm && c->y_dot_v && c->v_norm && c->v_dot &&
+           c->route_count && c->y_buf && c->down_buf && c->selected_buf;
+}
+
+static void expert_prune_collector_free(ds4_expert_prune_collector *c) {
+    if (!c) return;
+    free(c->y_norm);
+    free(c->y_dot_v);
+    free(c->v_norm);
+    free(c->v_dot);
+    free(c->route_count);
+    free(c->y_buf);
+    free(c->down_buf);
+    free(c->selected_buf);
+    memset(c, 0, sizeof(*c));
+}
+
+static bool expert_prune_collect_layer_batch(
+        ds4_expert_prune_collector *c,
+        ds4_gpu_graph              *g,
+        uint32_t                    il,
+        uint32_t                    n_tokens) {
+    if (!c || n_tokens == 0) return true;
+    if (n_tokens > c->cap_tokens || il >= DS4_N_LAYER) return false;
+
+    const uint64_t y_bytes = (uint64_t)n_tokens * DS4_N_EMBD * sizeof(float);
+    const uint64_t down_bytes = (uint64_t)n_tokens * DS4_N_EXPERT_USED * DS4_N_EMBD * sizeof(float);
+    const uint64_t sel_bytes = (uint64_t)n_tokens * DS4_N_EXPERT_USED * sizeof(int);
+    if (ds4_gpu_tensor_read(g->batch_routed_out, 0, c->y_buf, y_bytes) == 0 ||
+        ds4_gpu_tensor_read(g->batch_routed_down, 0, c->down_buf, down_bytes) == 0 ||
+        ds4_gpu_tensor_read(g->batch_router_selected, 0, c->selected_buf, sel_bytes) == 0)
+    {
+        return false;
+    }
+
+    double *y_norm = &c->y_norm[il];
+    double *y_dot_v = c->y_dot_v + (size_t)il * DS4_N_EXPERT;
+    double *v_norm = c->v_norm + (size_t)il * DS4_N_EXPERT;
+    double *v_dot = c->v_dot + (size_t)il * DS4_N_EXPERT * DS4_N_EXPERT;
+    uint64_t *route_count = c->route_count + (size_t)il * DS4_N_EXPERT;
+
+    for (uint32_t t = 0; t < n_tokens; t++) {
+        const float *y = c->y_buf + (size_t)t * DS4_N_EMBD;
+        const int *sel = c->selected_buf + (size_t)t * DS4_N_EXPERT_USED;
+        const float *down = c->down_buf + (size_t)t * DS4_N_EXPERT_USED * DS4_N_EMBD;
+
+        double yy = 0.0;
+        for (uint32_t d = 0; d < DS4_N_EMBD; d++) {
+            const double yd = (double)y[d];
+            yy += yd * yd;
+        }
+        *y_norm += yy;
+
+        for (uint32_t a = 0; a < DS4_N_EXPERT_USED; a++) {
+            const int ea_i = sel[a];
+            if (ea_i < 0 || (uint32_t)ea_i >= DS4_N_EXPERT) continue;
+            const uint32_t ea = (uint32_t)ea_i;
+            const float *va = down + (size_t)a * DS4_N_EMBD;
+            double yav = 0.0;
+            double vav = 0.0;
+            for (uint32_t d = 0; d < DS4_N_EMBD; d++) {
+                const double x = (double)va[d];
+                yav += (double)y[d] * x;
+                vav += x * x;
+            }
+            y_dot_v[ea] += yav;
+            v_norm[ea] += vav;
+            route_count[ea]++;
+            c->observed_routes++;
+
+            for (uint32_t b = 0; b < DS4_N_EXPERT_USED; b++) {
+                const int eb_i = sel[b];
+                if (eb_i < 0 || (uint32_t)eb_i >= DS4_N_EXPERT) continue;
+                const uint32_t eb = (uint32_t)eb_i;
+                const float *vb = down + (size_t)b * DS4_N_EMBD;
+                double dot = 0.0;
+                for (uint32_t d = 0; d < DS4_N_EMBD; d++) {
+                    dot += (double)va[d] * (double)vb[d];
+                }
+                v_dot[(size_t)ea * DS4_N_EXPERT + eb] += dot;
+            }
+        }
+    }
+    c->observed_tokens += n_tokens;
+    c->chunks++;
+    return true;
+}
+
+static uint32_t expert_prune_keep_count_for_ratio(float keep_ratio) {
+    if (!isfinite(keep_ratio) || keep_ratio <= 0.0f || keep_ratio > 1.0f) keep_ratio = 0.875f;
+    uint32_t keep = (uint32_t)floorf((float)DS4_N_EXPERT * keep_ratio + 1.0e-6f);
+    if (keep < DS4_N_EXPERT_USED) keep = DS4_N_EXPERT_USED;
+    if (keep > DS4_N_EXPERT) keep = DS4_N_EXPERT;
+    return keep;
+}
+
+static uint32_t expert_prune_omp_select_layer(
+        const ds4_expert_prune_collector *c,
+        uint32_t                          il,
+        uint32_t                          keep_count,
+        uint32_t                         *kept_out) {
+    bool selected[DS4_MAX_EXPERT] = { false };
+    float residual_dot[DS4_MAX_EXPERT];
+    const double *y_dot_v = c->y_dot_v + (size_t)il * DS4_N_EXPERT;
+    const double *v_norm = c->v_norm + (size_t)il * DS4_N_EXPERT;
+    const double *v_dot = c->v_dot + (size_t)il * DS4_N_EXPERT * DS4_N_EXPERT;
+    uint32_t n = 0;
+
+    for (uint32_t e = 0; e < DS4_N_EXPERT; e++) residual_dot[e] = (float)y_dot_v[e];
+    while (n < keep_count && n < DS4_N_EXPERT) {
+        int best = -1;
+        float best_gain = -INFINITY;
+        for (uint32_t e = 0; e < DS4_N_EXPERT; e++) {
+            if (selected[e]) continue;
+            const float gain = 2.0f * residual_dot[e] - (float)v_norm[e];
+            if (best < 0 || gain > best_gain ||
+                (gain == best_gain && c->route_count[prune_layer_expert_off(il, e)] >
+                                      c->route_count[prune_layer_expert_off(il, (uint32_t)best)])) {
+                best = (int)e;
+                best_gain = gain;
+            }
+        }
+        if (best < 0) break;
+        selected[best] = true;
+        kept_out[n++] = (uint32_t)best;
+        for (uint32_t e = 0; e < DS4_N_EXPERT; e++) {
+            residual_dot[e] -= (float)v_dot[(size_t)best * DS4_N_EXPERT + e];
+        }
+    }
+
+    while (n < keep_count) {
+        int best = -1;
+        for (uint32_t e = 0; e < DS4_N_EXPERT; e++) {
+            if (selected[e]) continue;
+            if (best < 0 ||
+                c->route_count[prune_layer_expert_off(il, e)] >
+                c->route_count[prune_layer_expert_off(il, (uint32_t)best)] ||
+                (c->route_count[prune_layer_expert_off(il, e)] ==
+                 c->route_count[prune_layer_expert_off(il, (uint32_t)best)] &&
+                 v_norm[e] > v_norm[(uint32_t)best])) {
+                best = (int)e;
+            }
+        }
+        if (best < 0) break;
+        selected[best] = true;
+        kept_out[n++] = (uint32_t)best;
+    }
+
+    for (uint32_t i = 1; i < n; i++) {
+        uint32_t v = kept_out[i];
+        uint32_t j = i;
+        while (j > 0 && kept_out[j - 1] > v) {
+            kept_out[j] = kept_out[j - 1];
+            j--;
+        }
+        kept_out[j] = v;
+    }
+    return n;
+}
+
+static bool expert_prune_mask_write_json(
+        const ds4_expert_prune_collector *c,
+        const char                       *path) {
+    const uint32_t keep_count = expert_prune_keep_count_for_ratio(c->keep_ratio);
+    FILE *fp = fopen(path, "wb");
+    if (!fp) {
+        fprintf(stderr, "ds4: failed to open expert prune mask output %s: %s\n", path, strerror(errno));
+        return false;
+    }
+
+    fprintf(fp,
+            "{\n"
+            "  \"format\":\"ds4-expert-mask-v1\",\n"
+            "  \"model\":\"%s\",\n"
+            "  \"dataset\":\"",
+            DS4_MODEL_SHAPE_NAME);
+    const char *dataset = c->dataset_path ? c->dataset_path : "";
+    for (const char *p = dataset; *p; p++) {
+        if (*p == '"' || *p == '\\') fputc('\\', fp);
+        fputc((unsigned char)*p, fp);
+    }
+    fprintf(fp,
+            "\",\n"
+            "  \"n_layer\":%u,\n"
+            "  \"n_expert\":%u,\n"
+            "  \"top_k\":%u,\n"
+            "  \"keep_ratio\":%.9g,\n"
+            "  \"keep_per_layer\":%u,\n"
+            "  \"observed_tokens\":%" PRIu64 ",\n"
+            "  \"observed_routes\":%" PRIu64 ",\n"
+            "  \"layers\":[\n",
+            DS4_N_LAYER,
+            DS4_N_EXPERT,
+            DS4_N_EXPERT_USED,
+            (double)c->keep_ratio,
+            keep_count,
+            c->observed_tokens,
+            c->observed_routes);
+
+    uint32_t kept[DS4_MAX_EXPERT];
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        const uint32_t n_kept = expert_prune_omp_select_layer(c, il, keep_count, kept);
+        if (n_kept < DS4_N_EXPERT_USED) {
+            fprintf(stderr, "ds4: OMP selected too few experts for layer %u\n", il);
+            fclose(fp);
+            return false;
+        }
+        fprintf(fp, "    {\"layer\":%u,\"keep\":[", il);
+        for (uint32_t i = 0; i < n_kept; i++) {
+            if (i) fputc(',', fp);
+            fprintf(fp, "%u", kept[i]);
+        }
+        fprintf(fp, "],\"route_count\":[");
+        for (uint32_t e = 0; e < DS4_N_EXPERT; e++) {
+            if (e) fputc(',', fp);
+            fprintf(fp, "%" PRIu64, c->route_count[prune_layer_expert_off(il, e)]);
+        }
+        fputs("]}", fp);
+        if (il + 1 < DS4_N_LAYER) fputc(',', fp);
+        fputc('\n', fp);
+    }
+    fputs("  ]\n}\n", fp);
+
+    if (fclose(fp) != 0) {
+        fprintf(stderr, "ds4: failed to close expert prune mask output %s: %s\n", path, strerror(errno));
+        return false;
+    }
+    return true;
+}
+
 static bool metal_graph_reset_prefill_state(ds4_gpu_graph *g) {
     memset(g->layer_n_comp, 0, sizeof(g->layer_n_comp));
     memset(g->layer_n_index_comp, 0, sizeof(g->layer_n_index_comp));
@@ -13949,6 +14494,7 @@ static bool metal_graph_prefill_layer_major(
         float                 *logits,
         bool                   show_progress,
         ds4_imatrix_collector *imatrix,
+        ds4_expert_prune_collector *expert_prune,
         ds4_session_progress_fn display_progress,
         void                  *display_progress_ud) {
     if (n_tokens == 0 || n_tokens > g->prefill_cap) return false;
@@ -13974,7 +14520,8 @@ static bool metal_graph_prefill_layer_major(
     const bool throttle = graph_power_throttle_enabled(g);
     const bool callback_split = display_progress != NULL && n_tokens >= 32;
     const bool split_commands = split_profile || throttle || callback_split ||
-                                n_tokens > 2048 || imatrix != NULL;
+                                n_tokens > 2048 || imatrix != NULL ||
+                                expert_prune != NULL;
     const bool profile = getenv("DS4_METAL_GRAPH_PREFILL_PROFILE") != NULL || split_profile;
     const double t0 = profile ? now_sec() : 0.0;
     double encode_s = 0.0;
@@ -14116,6 +14663,7 @@ static bool metal_graph_prefill_layer_major(
             if (ok) ok = ds4_gpu_end_commands() != 0;
             const double t_ffn_done = now_sec();
             if (ok && imatrix) ok = imatrix_collect_layer_batch(imatrix, g, il, (uint32_t)n_tokens);
+            if (ok && expert_prune) ok = expert_prune_collect_layer_batch(expert_prune, g, il, (uint32_t)n_tokens);
             layer_elapsed = (t_attn_done - t_attn0) + (t_ffn_done - t_ffn0);
 
             encode_s += (t_attn_encoded - t_attn0) + (t_ffn_encoded - t_ffn0);
@@ -14140,6 +14688,7 @@ static bool metal_graph_prefill_layer_major(
             if (ok) ok = ds4_gpu_end_commands() != 0;
             const double t_done = (profile || throttle) ? now_sec() : 0.0;
             if (ok && imatrix) ok = imatrix_collect_layer_batch(imatrix, g, il, (uint32_t)n_tokens);
+            if (ok && expert_prune) ok = expert_prune_collect_layer_batch(expert_prune, g, il, (uint32_t)n_tokens);
             layer_elapsed = t_done - t_chunk0;
             if (profile) {
                 encode_s += t_encoded - t_chunk0;
@@ -14249,6 +14798,7 @@ static bool metal_graph_prefill_raw_swa(
                                            logits,
                                            show_progress,
                                            NULL,
+                                           NULL,
                                            display_progress,
                                            display_progress_ud);
 }
@@ -14274,7 +14824,8 @@ static bool metal_graph_prefill_chunked_range(
         void                  *progress_ud,
         ds4_session_progress_fn display_progress,
         void                  *display_progress_ud,
-        ds4_imatrix_collector *imatrix) {
+        ds4_imatrix_collector *imatrix,
+        ds4_expert_prune_collector *expert_prune) {
     if (n_tokens == 0 || g->prefill_cap == 0) return false;
     if (start > (uint32_t)prompt->len) return false;
     if (n_tokens > (uint32_t)prompt->len - start) return false;
@@ -14316,6 +14867,7 @@ static bool metal_graph_prefill_chunked_range(
                                                   chunk_logits,
                                                   show_progress,
                                                   imatrix,
+                                                  expert_prune,
                                                   display_progress,
                                                   display_progress_ud);
         if (!ok) {
@@ -14372,6 +14924,7 @@ static bool metal_graph_prefill_chunked(
                                              progress_ud,
                                              display_progress,
                                              display_progress_ud,
+                                             NULL,
                                              NULL);
 }
 
@@ -15059,6 +15612,7 @@ struct ds4_engine {
     ds4_vocab vocab;
     ds4_weights weights;
     ds4_mtp_weights mtp_weights;
+    ds4_expert_mask expert_mask;
     ds4_backend backend;
     int mtp_draft_tokens;
     float mtp_margin;
@@ -16025,6 +16579,7 @@ static int generate_raw_swa_cpu(
         const float       * directional_steering_dirs,
         float               directional_steering_attn,
         float               directional_steering_ffn,
+        const ds4_expert_mask *expert_mask,
         ds4_token_emit_fn   emit,
         ds4_generation_done_fn done,
         void              * emit_ud,
@@ -16055,7 +16610,8 @@ static int generate_raw_swa_cpu(
     prefill_layer_major_cpu(logits, model, weights, &cache, prompt,
                             directional_steering_dirs,
                             directional_steering_attn,
-                            directional_steering_ffn);
+                            directional_steering_ffn,
+                            expert_mask);
 
     const double t_prefill1 = now_sec();
     fprintf(stderr, "ds4: prefill %d/%d done\n", prompt->len, prompt->len);
@@ -16103,6 +16659,7 @@ static int generate_raw_swa_cpu(
                                                  directional_steering_dirs,
                                                  directional_steering_attn,
                                                  directional_steering_ffn,
+                                                 expert_mask,
                                                  &decode_scratch);
         ds4_alloc_guard_end();
         if (token_timing) {
@@ -16144,6 +16701,7 @@ static int generate_metal_graph_raw_swa(
         const char        * directional_steering_file,
         float               directional_steering_attn,
         float               directional_steering_ffn,
+        const ds4_expert_mask *expert_mask,
         ds4_token_emit_fn   emit,
         ds4_generation_done_fn done,
         void              * emit_ud,
@@ -16173,6 +16731,7 @@ static int generate_metal_graph_raw_swa(
     }
     g.quality = quality;
     g.power_percent = power_percent > 0 ? (uint32_t)power_percent : 100u;
+    g.expert_mask = expert_mask;
     if (!metal_graph_load_directional_steering(&g,
                                                directional_steering_file,
                                                directional_steering_attn,
@@ -17561,42 +18120,6 @@ int ds4_dump_text_tokenization(const char *model_path, const char *text, FILE *f
 }
 
 #ifndef DS4_NO_GPU
-static bool imatrix_read_text_file(const char *path, char **out, size_t *len_out) {
-    *out = NULL;
-    *len_out = 0;
-    struct stat st;
-    if (stat(path, &st) != 0) {
-        fprintf(stderr, "ds4: failed to stat imatrix dataset %s: %s\n", path, strerror(errno));
-        return false;
-    }
-    if (st.st_size < 0 || (uint64_t)st.st_size > SIZE_MAX - 1) {
-        fprintf(stderr, "ds4: imatrix dataset is too large: %s\n", path);
-        return false;
-    }
-    FILE *fp = fopen(path, "rb");
-    if (!fp) {
-        fprintf(stderr, "ds4: failed to open imatrix dataset %s: %s\n", path, strerror(errno));
-        return false;
-    }
-    size_t n = (size_t)st.st_size;
-    char *buf = xmalloc(n + 1);
-    if (n != 0 && fread(buf, 1, n, fp) != n) {
-        fprintf(stderr, "ds4: failed to read imatrix dataset %s\n", path);
-        fclose(fp);
-        free(buf);
-        return false;
-    }
-    if (fclose(fp) != 0) {
-        fprintf(stderr, "ds4: failed to close imatrix dataset %s: %s\n", path, strerror(errno));
-        free(buf);
-        return false;
-    }
-    buf[n] = '\0';
-    *out = buf;
-    *len_out = n;
-    return true;
-}
-
 static char *imatrix_trim_block(char *p, char *end) {
     while (p < end && isspace((unsigned char)*p)) p++;
     while (end > p && isspace((unsigned char)end[-1])) end--;
@@ -17630,7 +18153,7 @@ int ds4_engine_collect_imatrix(ds4_engine *e,
 
     char *dataset = NULL;
     size_t dataset_len = 0;
-    if (!imatrix_read_text_file(dataset_path, &dataset, &dataset_len)) return 1;
+    if (!ds4_read_whole_text_file(dataset_path, "imatrix dataset", &dataset, &dataset_len)) return 1;
 
     const ds4_model *model = &e->model;
     const ds4_weights *weights = &e->weights;
@@ -17697,13 +18220,15 @@ int ds4_engine_collect_imatrix(ds4_engine *e,
                                                            NULL, false,
                                                            NULL, NULL,
                                                            NULL, NULL,
-                                                           &collector);
+                                                           &collector,
+                                                           NULL);
                 } else {
                     ok = metal_graph_prefill_layer_major(&g, model, weights,
                                                          &prompt, 0,
                                                          (uint32_t)prompt.len,
                                                          NULL, false,
                                                          &collector,
+                                                         NULL,
                                                          NULL, NULL);
                 }
                 if (!ok) {
@@ -17752,6 +18277,193 @@ int ds4_engine_collect_imatrix(ds4_engine *e,
 #endif
 }
 
+#ifndef DS4_NO_GPU
+static bool expert_prune_is_rendered_chat_prompt(const char *prompt_text) {
+    const char *bos = "<｜begin▁of▁sentence｜>";
+    return prompt_text && strncmp(prompt_text, bos, strlen(bos)) == 0;
+}
+
+static bool expert_prune_tokenize_prompt(ds4_engine *e, const char *prompt_text, token_vec *prompt) {
+    if (expert_prune_is_rendered_chat_prompt(prompt_text)) {
+        ds4_tokenize_rendered_chat(e, prompt_text, prompt);
+    } else {
+        ds4_tokenize_text(e, prompt_text, prompt);
+    }
+    return prompt->len > 0;
+}
+#endif
+
+int ds4_engine_collect_expert_prune_mask(ds4_engine *e,
+                                         const char *dataset_path,
+                                         const char *output_path,
+                                         int ctx_size,
+                                         int max_prompts,
+                                         int max_tokens,
+                                         float keep_ratio) {
+#ifdef DS4_NO_GPU
+    (void)e;
+    (void)dataset_path;
+    (void)output_path;
+    (void)ctx_size;
+    (void)max_prompts;
+    (void)max_tokens;
+    (void)keep_ratio;
+    fprintf(stderr, "ds4: expert pruning calibration requires a graph backend build\n");
+    return 1;
+#else
+    if (!e || !dataset_path || !output_path) return 1;
+    if (!ds4_backend_uses_graph(e->backend) || !e->metal_ready) {
+        fprintf(stderr, "ds4: expert pruning calibration requires --cuda or --metal graph backend\n");
+        return 1;
+    }
+    if (e->expert_mask.loaded) {
+        fprintf(stderr, "ds4: expert pruning calibration should run without --expert-mask\n");
+        return 1;
+    }
+    if (ctx_size <= 0) ctx_size = 32768;
+    if (!isfinite(keep_ratio) || keep_ratio <= 0.0f || keep_ratio > 1.0f) keep_ratio = 0.875f;
+    const uint32_t keep_count = expert_prune_keep_count_for_ratio(keep_ratio);
+
+    char *dataset = NULL;
+    size_t dataset_len = 0;
+    if (!ds4_read_whole_text_file(dataset_path, "expert prune dataset", &dataset, &dataset_len)) return 1;
+
+    const ds4_model *model = &e->model;
+    const ds4_weights *weights = &e->weights;
+    const uint32_t prefill_cap = metal_graph_prefill_cap_for_prompt(ctx_size);
+    const uint32_t raw_cap = metal_graph_raw_cap_for_context(ctx_size, prefill_cap);
+
+    ds4_gpu_graph g;
+    bool ok = metal_graph_alloc_raw_cap(&g, weights, &weights->layer[0],
+                                        raw_cap, (uint32_t)ctx_size, prefill_cap, false);
+    if (!ok) {
+        fprintf(stderr, "ds4: failed to allocate expert pruning graph runtime\n");
+        free(dataset);
+        return 1;
+    }
+    g.quality = e->quality;
+    g.power_percent = (uint32_t)e->power_percent;
+
+    ds4_expert_prune_collector collector;
+    if (!expert_prune_collector_init(&collector, prefill_cap, keep_ratio, dataset_path)) {
+        fprintf(stderr, "ds4: failed to allocate expert pruning collector\n");
+        metal_graph_free(&g);
+        free(dataset);
+        return 1;
+    }
+
+    fprintf(stderr,
+            "ds4: collecting OMP expert-prune stats from %s (model=%s, layers=%u, experts=%u, keep=%u/%u, ctx=%d, chunk=%u)\n",
+            dataset_path,
+            DS4_MODEL_SHAPE_NAME,
+            DS4_N_LAYER,
+            DS4_N_EXPERT,
+            keep_count,
+            DS4_N_EXPERT,
+            ctx_size,
+            prefill_cap);
+
+    int prompts_done = 0;
+    int tokens_done = 0;
+    char *cursor = dataset;
+    const char *marker_lit = "===== DS4_IMATRIX_PROMPT";
+    while (*cursor) {
+        char *start = cursor;
+        char *marker = strstr(cursor, marker_lit);
+        if (marker) {
+            char *nl = strchr(marker, '\n');
+            if (!nl) break;
+            start = nl + 1;
+        } else if (prompts_done != 0) {
+            break;
+        }
+
+        char *next = strstr(start, marker_lit);
+        char *end = next ? next : dataset + dataset_len;
+        char saved = *end;
+        char *prompt_text = imatrix_trim_block(start, end);
+        if (prompt_text[0] != '\0') {
+            token_vec prompt = {0};
+            if (expert_prune_tokenize_prompt(e, prompt_text, &prompt)) {
+                if (prompt.len > ctx_size) prompt.len = ctx_size;
+                if (max_tokens > 0 && prompt.len > max_tokens - tokens_done) {
+                    prompt.len = max_tokens - tokens_done;
+                }
+                if (prompt.len > 0) {
+                    if (!metal_graph_reset_prefill_state(&g)) {
+                        fprintf(stderr, "ds4: failed to reset expert pruning graph state\n");
+                        ok = false;
+                    } else if ((uint32_t)prompt.len > prefill_cap) {
+                        ok = metal_graph_prefill_chunked_range(&g, model, weights,
+                                                               &prompt, 0,
+                                                               (uint32_t)prompt.len,
+                                                               NULL, false,
+                                                               NULL, NULL,
+                                                               NULL, NULL,
+                                                               NULL,
+                                                               &collector);
+                    } else {
+                        ok = metal_graph_prefill_layer_major(&g, model, weights,
+                                                             &prompt, 0,
+                                                             (uint32_t)prompt.len,
+                                                             NULL, false,
+                                                             NULL,
+                                                             &collector,
+                                                             NULL, NULL);
+                    }
+                    if (!ok) {
+                        fprintf(stderr, "ds4: expert pruning prefill failed at prompt %d\n", prompts_done + 1);
+                        token_vec_free(&prompt);
+                        *end = saved;
+                        break;
+                    }
+                    prompts_done++;
+                    tokens_done += prompt.len;
+                    if (prompts_done % 10 == 0) {
+                        fprintf(stderr,
+                                "ds4: expert-prune prompts=%d tokens=%d routes=%llu\r",
+                                prompts_done,
+                                tokens_done,
+                                (unsigned long long)collector.observed_routes);
+                        fflush(stderr);
+                    }
+                }
+            }
+            token_vec_free(&prompt);
+        }
+        *end = saved;
+        if (!next) break;
+        cursor = next;
+        if (max_prompts > 0 && prompts_done >= max_prompts) break;
+        if (max_tokens > 0 && tokens_done >= max_tokens) break;
+    }
+    fputc('\n', stderr);
+
+    if (ok && prompts_done == 0) {
+        fprintf(stderr, "ds4: expert pruning dataset produced no prompt tokens\n");
+        ok = false;
+    }
+    if (ok) {
+        ok = expert_prune_mask_write_json(&collector, output_path);
+        if (ok) {
+            fprintf(stderr,
+                    "ds4: wrote expert mask %s from %d prompts, %d tokens, %llu routed observations (keep=%u/%u)\n",
+                    output_path,
+                    prompts_done,
+                    tokens_done,
+                    (unsigned long long)collector.observed_routes,
+                    keep_count,
+                    DS4_N_EXPERT);
+        }
+    }
+
+    expert_prune_collector_free(&collector);
+    metal_graph_free(&g);
+    free(dataset);
+    return ok ? 0 : 1;
+#endif
+}
+
 int ds4_engine_generate_argmax(
         ds4_engine        *e,
         const ds4_tokens  *prompt,
@@ -17779,6 +18491,7 @@ int ds4_engine_generate_argmax(
                                             e->directional_steering_file,
                                             e->directional_steering_attn_scale,
                                             e->directional_steering_ffn_scale,
+                                            &e->expert_mask,
                                             emit, done, emit_ud,
                                             progress, progress_ud);
 #else
@@ -17793,6 +18506,7 @@ int ds4_engine_generate_argmax(
                                 e->directional_steering_dirs,
                                 e->directional_steering_attn_scale,
                                 e->directional_steering_ffn_scale,
+                                &e->expert_mask,
                                 emit, done, emit_ud, progress, progress_ud);
 }
 
@@ -17897,7 +18611,7 @@ int ds4_engine_head_test(ds4_engine *e, const ds4_tokens *prompt) {
 
     float *after_ffn_hc = xmalloc((size_t)n_hc * DS4_N_EMBD * sizeof(after_ffn_hc[0]));
     layer_ffn_one(after_ffn_hc, model, layer0, after_attn_hc, 0, prompt->v[prompt->len - 1],
-                  NULL, 0.0f, true);
+                  NULL, 0.0f, true, NULL);
     print_vec_stats("blk.0 after_ffn_hc", after_ffn_hc, (uint64_t)n_hc * DS4_N_EMBD);
 
     float *logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(logits[0]));
@@ -18015,6 +18729,19 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
     if (!opt->inspect_only) vocab_load(&e->vocab, &e->model);
     config_validate_model(&e->model);
     weights_bind(&e->weights, &e->model);
+    if (opt->expert_mask_file && opt->expert_mask_file[0]) {
+        if (e->backend == DS4_BACKEND_METAL) {
+            fprintf(stderr, "ds4: --expert-mask is currently supported on CPU/CUDA, not Metal\n");
+            ds4_engine_close(e);
+            *out = NULL;
+            return 1;
+        }
+        if (!expert_mask_load_json(&e->expert_mask, opt->expert_mask_file)) {
+            ds4_engine_close(e);
+            *out = NULL;
+            return 1;
+        }
+    }
     if (opt->inspect_only) {
         *out = e;
         return 0;
@@ -18187,6 +18914,7 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
         free(s);
         return 1;
     }
+    s->graph.expert_mask = &e->expert_mask;
     s->graph.quality = e->quality;
     s->graph.power_percent = (uint32_t)e->power_percent;
     if (!metal_graph_load_directional_steering(&s->graph,
@@ -18308,6 +19036,7 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
                                                          e->directional_steering_dirs,
                                                          e->directional_steering_attn_scale,
                                                          e->directional_steering_ffn_scale,
+                                                         &e->expert_mask,
                                                          &s->cpu_scratch);
                 token_vec_push(&s->checkpoint, prompt->v[i]);
                 if (s->progress) s->progress(s->progress_ud, "prefill_chunk", i + 1, prompt->len);
@@ -18324,7 +19053,8 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
                                 prompt,
                                 e->directional_steering_dirs,
                                 e->directional_steering_attn_scale,
-                                e->directional_steering_ffn_scale);
+                                e->directional_steering_ffn_scale,
+                                &e->expert_mask);
         ds4_tokens_copy(&s->checkpoint, prompt);
         s->checkpoint_valid = true;
         s->mtp_draft_valid = false;
@@ -18368,6 +19098,7 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
                                                         progress_fn ? &progress : NULL,
                                                         s->display_progress,
                                                         s->display_progress_ud,
+                                                        NULL,
                                                         NULL);
             if (!ok) {
                 snprintf(err, errlen, "%s resumed prefill failed while extending checkpoint", backend_name);
@@ -18604,6 +19335,7 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
                                                  e->directional_steering_dirs,
                                                  e->directional_steering_attn_scale,
                                                  e->directional_steering_ffn_scale,
+                                                 &e->expert_mask,
                                                  &s->cpu_scratch);
         token_vec_push(&s->checkpoint, token);
         s->checkpoint_valid = true;
