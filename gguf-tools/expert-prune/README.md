@@ -70,3 +70,29 @@ Use the generated mask on CPU/CUDA runtime surfaces:
 The mask is also exposed on `ds4-eval`, `ds4-bench`, `ds4-server`, and
 `ds4-agent` as `--expert-mask FILE`. Masked inference is not currently supported
 on Metal.
+
+## 4. Sweep Keep Ratios
+
+To find the lowest coarse keep ratio that still produces readable output, run:
+
+```sh
+python3 gguf-tools/expert-prune/sweep_expert_keep_ratios.py \
+  --model ds4flash.gguf \
+  --dataset gguf-tools/expert-prune/ds4-c4-prune.txt \
+  --gpus 0,1,2,3,5,7 \
+  --expert-prune-max-tokens 131072
+```
+
+The script generates OMP masks for `100%, 90%, ..., 10%`, assigns one ratio at
+a time to the listed GPUs, then runs a short masked inference test. It also sets
+a per-GPU `DS4_LOCK_FILE` under the run directory so the CLI's default
+`/tmp/ds4.lock` singleton guard does not serialize different GPUs. All masks,
+logs, generated text, and summaries are written under
+`gguf-tools/expert-prune/sweep-runs/`.
+
+If the calibration file does not exist yet, add `--build-c4` to build it first
+with `build_c4_prune_dataset.py`.
+
+The pass/fail check is an automatic readability smoke test, not a benchmark or
+human quality evaluation. Inspect each ratio's `test.stdout.txt`, especially
+near the cutoff reported in `summary.md`.
