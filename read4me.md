@@ -17,7 +17,7 @@ python3 gguf-tools/expert-prune/build_c4_prune_dataset.py \
   --max-docs 512
 ```
 
-生成每层保留 7/8 专家的 mask：
+生成每层保留 0.36% 专家的 mask：
 
 ```sh
 CUDA_VISIBLE_DEVICES=4 ./ds4 --cuda \
