@@ -11367,7 +11367,7 @@ static void usage(FILE *fp) {
         "  --dir-steering-attn F\n"
         "      Apply steering after attention outputs. Default: 0\n"
         "  --expert-mask FILE\n"
-        "      Load a ds4-expert-mask-v1 JSON keep-list and avoid pruned experts in CPU/CUDA routing.\n"
+        "      Load a ds4-expert-mask-v1 JSON keep-list and avoid pruned experts in CPU/CUDA/Metal routing.\n"
         "  --warm-weights\n"
         "      Touch mapped tensor pages before serving. Slower startup, fewer first-use stalls.\n"
         "  --power N\n"

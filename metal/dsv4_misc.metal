@@ -85,8 +85,15 @@ struct ds4_metal_args_dsv4_router_select_one {
     uint32_t has_bias;
     uint32_t hash_mode;
     uint32_t use_token_buffer;
+    uint32_t has_expert_mask;
     uint32_t token;
     uint32_t hash_rows;
+};
+
+struct ds4_metal_args_dsv4_router_mask_scores {
+    uint32_t n_expert;
+    uint32_t n_tokens;
+    uint32_t has_bias;
 };
 
 struct ds4_metal_args_dsv4_directional_steering_project {
@@ -218,6 +225,36 @@ kernel void kernel_dsv4_router_weights_one(
     w[tid] = p[s[tid]] / sum * 1.5f;
 }
 
+static inline void dsv4_router_hash_apply_mask(
+        device int32_t *selected,
+        device const int32_t *row,
+        device const uint8_t *expert_mask) {
+    uint n = 0;
+    for (uint i = 0; i < 6; i++) {
+        const int32_t e = row[i];
+        if (e >= 0 && e < 256 && expert_mask[e] != 0) {
+            selected[n++] = e;
+        }
+    }
+    for (uint e = 0; n < 6 && e < 256; e++) {
+        if (expert_mask[e] == 0) {
+            continue;
+        }
+        bool exists = false;
+        for (uint j = 0; j < n; j++) {
+            if (selected[j] == (int32_t)e) {
+                exists = true;
+            }
+        }
+        if (!exists) {
+            selected[n++] = (int32_t)e;
+        }
+    }
+    for (uint i = n; i < 6; i++) {
+        selected[i] = 0;
+    }
+}
+
 // Decode router selection for one token after the existing
 // sqrt(softplus(logit)) probability kernel has run. Bias affects only top-k
 // selection. Route-weight normalization deliberately stays in the old one-token
@@ -229,6 +266,7 @@ kernel void kernel_dsv4_router_finalize_one(
         device const float *bias,
         device const int32_t *hash,
         device const int32_t *tokens,
+        device const uint8_t *expert_mask,
         device int32_t *selected,
         threadgroup float *scratch [[threadgroup(0)]],
         uint tid [[thread_position_in_threadgroup]]) {
@@ -237,7 +275,9 @@ kernel void kernel_dsv4_router_finalize_one(
     threadgroup float *sel_scores = scratch;
     threadgroup int32_t *idx = (threadgroup int32_t *)(scratch + 256);
     const float p = probs[tid];
-    sel_scores[tid] = args.has_bias ? p + bias[tid] : p;
+    sel_scores[tid] = (args.has_expert_mask && expert_mask[tid] == 0)
+        ? -INFINITY
+        : (args.has_bias ? p + bias[tid] : p);
     idx[tid] = (int32_t)tid;
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -246,8 +286,12 @@ kernel void kernel_dsv4_router_finalize_one(
             const uint token = args.use_token_buffer ? (uint)tokens[0] : args.token;
             const uint row = min(token, args.hash_rows - 1u);
             device const int32_t *src = hash + row * 6u;
-            for (uint i = 0; i < 6; i++) {
-                selected[i] = src[i];
+            if (args.has_expert_mask) {
+                dsv4_router_hash_apply_mask(selected, src, expert_mask);
+            } else {
+                for (uint i = 0; i < 6; i++) {
+                    selected[i] = src[i];
+                }
             }
         }
     } else {
@@ -277,6 +321,33 @@ kernel void kernel_dsv4_router_finalize_one(
         }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
+}
+
+kernel void kernel_dsv4_router_mask_scores(
+        constant ds4_metal_args_dsv4_router_mask_scores & args,
+        device const float *probs,
+        device const float *bias,
+        device const uint8_t *expert_mask,
+        device float *scores,
+        uint gid [[thread_position_in_grid]]) {
+    const uint n = args.n_expert * args.n_tokens;
+    if (gid >= n) {
+        return;
+    }
+
+    const uint e = gid % args.n_expert;
+    const float p = probs[gid];
+    scores[gid] = expert_mask[e] == 0
+        ? -INFINITY
+        : (args.has_bias ? p + bias[e] : p);
+}
+
+kernel void kernel_dsv4_router_apply_hash_mask(
+        device int32_t *selected,
+        device const uint8_t *expert_mask,
+        uint token [[thread_position_in_grid]]) {
+    device int32_t *row = selected + (uint64_t)token * 6u;
+    dsv4_router_hash_apply_mask(row, row, expert_mask);
 }
 
 // Fills the dense compressed-attention mask with -inf. The selected top-k rows

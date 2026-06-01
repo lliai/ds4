@@ -18730,12 +18730,6 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
     config_validate_model(&e->model);
     weights_bind(&e->weights, &e->model);
     if (opt->expert_mask_file && opt->expert_mask_file[0]) {
-        if (e->backend == DS4_BACKEND_METAL) {
-            fprintf(stderr, "ds4: --expert-mask is currently supported on CPU/CUDA, not Metal\n");
-            ds4_engine_close(e);
-            *out = NULL;
-            return 1;
-        }
         if (!expert_mask_load_json(&e->expert_mask, opt->expert_mask_file)) {
             ds4_engine_close(e);
             *out = NULL;

@@ -1,3 +1,5 @@
+## Linux运行
+
 你可以直接这样跑 C4 版本：
 
 ```sh
@@ -17,7 +19,7 @@ python3 gguf-tools/expert-prune/build_c4_prune_dataset.py \
   --max-docs 512
 ```
 
-生成每层保留 0.36% 专家的 mask：
+生成每层保留 36% 专家的 mask：
 
 ```sh
 CUDA_VISIBLE_DEVICES=4 ./ds4 --cuda \
@@ -96,3 +98,42 @@ curl -s -X POST http://127.0.0.1:8000/v1/chat/completions \
 ```sh
 kill <pid>
 ```
+
+## macOS Metal 运行
+
+在 macOS 上先构建 Metal 版本：
+
+```sh
+make
+```
+
+使用已有 expert mask 进行 Metal 推理：
+
+```sh
+./ds4 --metal \
+  -m ds4flash.gguf \
+  --expert-mask gguf-tools/expert-prune/ds4-c4-keep036.json \
+  --nothink \
+  -n 128 \
+  -p "Explain OMP expert pruning briefly."
+```
+
+部署 Metal HTTP server：
+
+```sh
+setsid env \
+  /path/to/ds4/ds4-server \
+    --chdir /path/to/ds4 \
+    --metal \
+    -m ./gguf/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf \
+    --expert-mask gguf-tools/expert-prune/ds4-c4-keep036.json \
+    --ctx 4096 \
+    -n 1024 \
+    --host 127.0.0.1 \
+    --port 8000 \
+    --kv-disk-dir /tmp/ds4-kv-metal \
+    --kv-disk-space-mb 4096 \
+    > /tmp/ds4-server-metal-8000.log 2>&1 < /dev/null &
+```
+
+说明：Metal 后端只在 macOS Metal 构建中可用；Linux 当前应继续使用 CUDA 或 CPU 后端。
